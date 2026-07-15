@@ -42,6 +42,96 @@
   let renderDirty = false;
   let els = {};
 
+  // ---------- undo/redo history (Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y = redo alias) ----------
+  // Debounced + diff-based snapshotting of the DOCUMENT — state.mix, .output,
+  // .outputEnabled, .pre, .source — NOT state.editTarget (that's just the UI
+  // cursor; undoing a param edit shouldn't also yank the user's selection
+  // around). scheduleHistorySync() is hooked into requestRender()/
+  // requestOutput() below (fired by essentially every doc mutation) plus a
+  // couple of mutators that never route through either — see those call
+  // sites. The 300ms debounce coalesces a whole scrub drag into ONE undo
+  // step; the diff against the last-recorded baseline makes redundant calls
+  // harmless, so hooking liberally is cheap and safe.
+  const HISTORY_LIMIT = 50;
+  let histUndo = []; // JSON strings we can go BACK to
+  let histRedo = []; // JSON strings we can go FORWARD to
+  let histPresent = null; // JSON string of the current doc (the baseline)
+  let histRestoring = false; // true while applyHistoryState runs — suppresses re-recording its own writes
+  let histTimer = null;
+
+  function docSnapshot() {
+    return JSON.stringify({
+      mix: state.mix,
+      output: state.output,
+      outputEnabled: state.outputEnabled,
+      pre: state.pre,
+      source: state.source,
+    });
+  }
+
+  function scheduleHistorySync() {
+    if (histRestoring) return;
+    if (histTimer) clearTimeout(histTimer);
+    histTimer = setTimeout(commitHistoryIfChanged, 300);
+  }
+
+  function commitHistoryIfChanged() {
+    histTimer = null;
+    const cur = docSnapshot();
+    if (histPresent === null) {
+      histPresent = cur; // first call anywhere — just establishes the baseline
+      return;
+    }
+    if (cur === histPresent) return; // debounce window elapsed but nothing actually changed
+    histUndo.push(histPresent);
+    if (histUndo.length > HISTORY_LIMIT) histUndo.shift();
+    histRedo = []; // a fresh edit invalidates the redo branch
+    histPresent = cur;
+  }
+
+  // Jumps the live doc to a stored snapshot and rewires every UI surface that
+  // holds closures over the OLD mix/output/pre/source objects — the same
+  // refresh set applyStyle() uses when it swaps the whole doc (see
+  // applyStyle() below), because a history jump IS exactly that: a new
+  // object graph, not just new values in the old one.
+  function applyHistoryState(json) {
+    histRestoring = true;
+    const s = JSON.parse(json);
+    state.mix = s.mix;
+    state.output = s.output;
+    state.outputEnabled = s.outputEnabled;
+    state.pre = s.pre;
+    state.source = s.source;
+    // Re-derive the committed PREPROCESS layer reference (front-of-stack),
+    // same rule applyStyle() uses — see reconcilePreLayer()/applyStyle().
+    preLayerRef = state.mix.length && state.mix[0].effect === 'preprocess' ? state.mix[0] : null;
+    // Keep editTarget valid: an undo/redo can put a 'layer' index out of range.
+    if (state.editTarget.kind === 'layer' && state.editTarget.index >= state.mix.length) {
+      state.editTarget = { kind: 'output' };
+    }
+    buildEditor(); // rewires the edit panel (incl. the OUTPUT tab, via its own buildOutputEditor() call) to the restored objects
+    buildEffectList(); // refresh the NEW-mode / picker highlight
+    buildMixList();
+    syncPreUI();
+    requestOutput();
+    histRestoring = false;
+  }
+
+  function historyUndo() {
+    if (histTimer) commitHistoryIfChanged(); // flush any pending (debounced) edit first
+    if (!histUndo.length) return;
+    histRedo.push(histPresent);
+    histPresent = histUndo.pop();
+    applyHistoryState(histPresent);
+  }
+  function historyRedo() {
+    if (histTimer) commitHistoryIfChanged();
+    if (!histRedo.length) return;
+    histUndo.push(histPresent);
+    histPresent = histRedo.pop();
+    applyHistoryState(histPresent);
+  }
+
   function visibleEffectList() {
     return RSTR.EFFECT_LIST.filter((d) => !d.internal && !state.disabled.has(d.id));
   }
@@ -139,11 +229,13 @@
 
   function requestRender() {
     renderDirty = true;
+    scheduleHistorySync(); // fires after essentially every doc mutation — see the history module above
   }
   function requestOutput() {
     outputDirty = true;
     renderDirty = true;
     refreshOutputVisuals();
+    scheduleHistorySync();
   }
 
   function frame() {
@@ -3095,6 +3187,11 @@
     els.qualityInput.addEventListener('input', () => {
       state.output.quality = Number(els.qualityInput.value);
       els.qualityValue.textContent = state.output.quality.toFixed(2);
+      // quality only affects export encode, never the live buffer, so this
+      // handler (uniquely among OUTPUT's fields) never calls requestRender/
+      // requestOutput — hook history directly so a quality-only change is
+      // still undoable.
+      scheduleHistorySync();
     });
   }
 
@@ -3738,9 +3835,32 @@
     // global Ctrl+V — image/style-aware paste anywhere except editable fields
     document.addEventListener('paste', handleGlobalPaste);
 
+    // global undo/redo — Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y as a redo alias. Same
+    // isEditableTarget guard handleGlobalPaste uses above, so Ctrl+Z inside
+    // the scrub click-to-type field, the color picker's hex field, ascii's
+    // character-set field, etc. does the browser's own native text undo
+    // instead of jumping the whole document.
+    document.addEventListener('keydown', (e) => {
+      if (isEditableTarget(e.target)) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const key = e.key.toLowerCase();
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        historyUndo();
+      } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+        e.preventDefault();
+        historyRedo();
+      }
+    });
+
     // patterns reads ImageData decoded async by assets.js — re-render
     // once decode lands, in case it rendered as passthrough first.
     if (RSTR.assetsReady) RSTR.assetsReady.then(requestRender);
+
+    // Establish the undo baseline now that boot's initial wiring (and any
+    // default style/image setup) is done — histPresent starts at THIS state,
+    // so the first real edit has something to undo back to.
+    commitHistoryIfChanged();
 
     requestAnimationFrame(frame);
   }
