@@ -1922,13 +1922,10 @@ void main() {
         // black-on-white), and the ink-density ramp (dark pixel -> dense char)
         // is only tonally correct in that polarity.
         //
-        // The tooooools original is a DOM terminal (font-family: monospace;
-        // line-height: 1.2; white-space: pre) — glyphs ALWAYS keep their
-        // natural monospace aspect; only the image SAMPLING (grid built above)
-        // stretches to fit the output's aspect, never the glyphs. So: measure
-        // the natural advance-width/line-height ratio once, fit the whole text
-        // block into w x h at that natural aspect (letterboxed + centered),
-        // then draw every glyph unscaled.
+        // RSTR outputs a full raster buffer, not a DOM terminal — stretch the
+        // grid to fill w x h so the ASCII art covers the whole frame and keeps
+        // the source aspect (tooooools letterboxes at natural glyph aspect,
+        // which leaves wide side margins on landscape images).
         const canvas = document.createElement('canvas');
         canvas.width = w;
         canvas.height = h;
@@ -1936,33 +1933,30 @@ void main() {
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, w, h);
 
-        ctx.font = '100px monospace';
-        const advRatio = ctx.measureText('M').width / 100; // advance-width / em, monospace
+        const cellW = w / totalCols;
+        const cellH = h / totalRows;
         const lineH = 1.2; // matches tooooools' CSS line-height
-
-        const fontPx = Math.max(1, Math.min(w / (totalCols * advRatio), h / (totalRows * lineH)));
-        const advW = fontPx * advRatio; // per-glyph advance at this font size
-        const cellH = fontPx * lineH; // per-line height at this font size
-        const offsetX = (w - totalCols * advW) / 2;
-        const offsetY = (h - totalRows * cellH) / 2;
+        const fontPx = Math.max(1, cellH / lineH);
 
         ctx.font = fontPx + 'px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillStyle = '#000';
+        const naturalAdv = ctx.measureText('M').width;
+        const scaleX = cellW / naturalAdv;
 
-        // Box-drawing border glyphs will show small vertical gaps at
-        // line-height 1.2 (cellH > glyph height) — the original DOM terminal
-        // has the exact same gaps between wrapped text lines, so this is
-        // faithful, not a bug.
         for (let ry = 0; ry < totalRows; ry++) {
           const row = finalGrid[ry];
-          const cy = offsetY + (ry + 0.5) * cellH;
           for (let rx = 0; rx < totalCols; rx++) {
             const ch = row[rx];
             if (!ch || ch === ' ') continue;
-            const cx = offsetX + (rx + 0.5) * advW;
-            ctx.fillText(ch, cx, cy);
+            const cx = (rx + 0.5) * cellW;
+            const cy = (ry + 0.5) * cellH;
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.scale(scaleX, 1);
+            ctx.fillText(ch, 0, 0);
+            ctx.restore();
           }
         }
 
